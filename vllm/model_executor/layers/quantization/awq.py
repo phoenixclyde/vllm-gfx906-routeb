@@ -122,30 +122,17 @@ class AWQConfig(QuantizationConfig):
             return AWQLinearMethod(self)
         elif isinstance(layer, RoutedExperts):
             # Lazy import to avoid circular import.
-            from .awq_marlin import AWQMarlinConfig
             from .moe_wna16 import MoeWNA16Config
-            from .utils.marlin_utils import check_moe_marlin_supports_layer
 
-            if on_gfx906() or not check_moe_marlin_supports_layer(
-                layer, self.group_size
-            ):
+            # AWQMoEMarlin was dropped upstream (the marlin kernels are gone)
+            # and gfx906 never supported it anyway, so MoE layers always take
+            # the Moe WNA16 path here.
+            if on_gfx906():
                 logger.warning_once(
-                    f"Layer '{prefix}' is not supported by AWQMoeMarlin or "
-                    "is running on gfx906. "
+                    f"Layer '{prefix}' is running on gfx906. "
                     "Falling back to Moe WNA16 kernels."
                 )
-                config = {
-                    "quant_method": "awq",
-                    "bits": self.weight_bits,
-                    "group_size": self.group_size,
-                    "zero_point": self.zero_point,
-                    "lm_head": False,
-                    "modules_to_not_convert": self.modules_to_not_convert,
-                }
-                return MoeWNA16Config.from_config(config).get_quant_method(
-                    layer, prefix
-                )
-            marlin_compatible_config_dict = {
+            config = {
                 "quant_method": "awq",
                 "bits": self.weight_bits,
                 "group_size": self.group_size,
@@ -153,10 +140,7 @@ class AWQConfig(QuantizationConfig):
                 "lm_head": False,
                 "modules_to_not_convert": self.modules_to_not_convert,
             }
-            awq_marlin_config = AWQMarlinConfig.from_config(
-                marlin_compatible_config_dict
-            )
-            return awq_marlin_config.get_quant_method(layer, prefix)
+            return MoeWNA16Config.from_config(config).get_quant_method(layer, prefix)
         return None
 
     def apply_vllm_mapper(self, hf_to_vllm_mapper: "WeightsMapper"):
