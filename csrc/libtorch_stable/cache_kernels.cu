@@ -1151,21 +1151,21 @@ __global__ void gather_and_maybe_dequant_cache_page(
 
       if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
         if constexpr (std::is_same<scalar_t, cache_t>::value) {
-          reinterpret_cast<stype*>(dst_)[idx] =
-              static_cast<stype>(reinterpret_cast<ltype*>(src_)[idx]);
+          reinterpret_cast<stype*>(output)[idx] =
+              static_cast<stype>(reinterpret_cast<const ltype*>(src)[idx]);
         } else {
-          // Cross-type dequant (e.g., half cache -> float/bf16 dst)
-          ltype loaded_val = reinterpret_cast<ltype*>(src_)[idx];
+          // Cross-type dequant (e.g. half cache -> float/bf16 dst).
+          // gfx906 has no bf16 support, so the cache dtype and the model dtype
+          // can differ and a plain static_cast would silently produce garbage.
+          ltype loaded_val = reinterpret_cast<const ltype*>(src)[idx];
           stype store_val;
 #pragma unroll
           for (int j = 0; j < vec_size; ++j) {
             __half h = *reinterpret_cast<const __half*>(&loaded_val.val[j]);
             store_val.val[j] = static_cast<scalar_t>(__half2float(h));
           }
-          reinterpret_cast<stype*>(dst_)[idx] = store_val;
+          reinterpret_cast<stype*>(output)[idx] = store_val;
         }
-        reinterpret_cast<stype*>(output)[idx] =
-            static_cast<stype>(reinterpret_cast<const ltype*>(src)[idx]);
       } else {
         const ltype loaded = reinterpret_cast<const ltype*>(src)[idx];
         stype converted;
@@ -1174,25 +1174,6 @@ __global__ void gather_and_maybe_dequant_cache_page(
           converted.val[j] = fp8::scaled_convert<scalar_t, cache_t, kv_dt>(
               loaded.val[j], scale_value);
         }
-        reinterpret_cast<stype*>(dst_)[idx] = store_val;
-      }
-    }
-    // process tail
-    constexpr int32_t tail_cnt = ENTRY_SIZE % vec_size;
-    dst_ = dst_ + ENTRY_SIZE - tail_cnt;
-    src_ = src_ + ENTRY_SIZE - tail_cnt;
-#pragma unroll
-    for (int idx = threadIdx.x; idx < tail_cnt; idx += CTA_SIZE) {
-      if constexpr (kv_dt == Fp8KVCacheDataType::kAuto) {
-        if constexpr (std::is_same<scalar_t, cache_t>::value) {
-          dst_[idx] = static_cast<scalar_t>(src_[idx]);
-        } else {
-          __half h = *reinterpret_cast<const __half*>(&src_[idx]);
-          dst_[idx] = static_cast<scalar_t>(__half2float(h));
-        }
-      } else {
-        dst_[idx] =
-            fp8::scaled_convert<scalar_t, cache_t, kv_dt>(src_[idx], *scale);
         reinterpret_cast<stype*>(output)[idx] = converted;
       }
     }
