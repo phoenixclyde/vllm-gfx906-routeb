@@ -894,9 +894,6 @@ def int4_w4a16_moe_quant_config(
     gemm1_alpha: float | None = None,
     gemm1_beta: float | None = None,
     gemm1_clamp_limit: float | None = None,
-    gemm1_clamp_limit: float | None = None,
-    gemm1_alpha: float | None = None,
-    gemm1_beta: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for 16-bit float activations and int4 weights.
@@ -910,9 +907,6 @@ def int4_w4a16_moe_quant_config(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
-        gemm1_clamp_limit=gemm1_clamp_limit,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_beta=gemm1_beta,
     )
 
 
@@ -969,9 +963,6 @@ def int8_w8a16_moe_quant_config(
     gemm1_alpha: float | None = None,
     gemm1_beta: float | None = None,
     gemm1_clamp_limit: float | None = None,
-    gemm1_clamp_limit: float | None = None,
-    gemm1_alpha: float | None = None,
-    gemm1_beta: float | None = None,
 ) -> FusedMoEQuantConfig:
     """
     Construct a quant config for 16-bit float activations and int8 weights.
@@ -985,9 +976,6 @@ def int8_w8a16_moe_quant_config(
         gemm1_alpha=gemm1_alpha,
         gemm1_beta=gemm1_beta,
         gemm1_clamp_limit=gemm1_clamp_limit,
-        gemm1_clamp_limit=gemm1_clamp_limit,
-        gemm1_alpha=gemm1_alpha,
-        gemm1_beta=gemm1_beta,
     )
 
 
