@@ -978,7 +978,13 @@ def _dequantize_kv_slice(qkv_proj, q_size: int, act_dtype):
             zp = _expand(zp, q.shape[1])[: q.shape[0], : q.shape[1]]
             q = (q - zp) * s
         else:
-            q = q * s
+            # ★★ symmetric 量化（无 zero_point）时，packed 以**补码**存储：
+            #    解包得到的却是 0..(2^bits-1) 的无符号值（实测 int4 为 1..15，
+            #    均值恰为 8），必须减去 2^(bits-1) 才能还原有符号值域。
+            #    漏掉这一步会产生 +2^(bits-1)*scale 的系统性偏移 ——
+            #    实测相对误差 417%、权重均值 +0.376（参考为 -0.00003），
+            #    导致 draft 的 fused KV 全错、投机解码接受率趋零。
+            q = (q - float(1 << (bit_width - 1))) * s
 
     full = q.to(act_dtype)
 
