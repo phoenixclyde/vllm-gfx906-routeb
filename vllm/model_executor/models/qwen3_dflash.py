@@ -376,6 +376,99 @@ class DFlashQwen3DecoderLayer(nn.Module):
 
 
 @support_torch_compile
+
+# [P03] gfx906: DFlash2 量化 draft 反量化
+def _dequantize_kv_slice(qkv_proj, q_size: int, act_dtype):
+    """返回 qkv_proj 的 KV 部分权重，已反量化为 act_dtype。
+
+    未量化层 : 直接 qkv_proj.weight[q_size:]
+    量化层   : 由 weight_packed/weight_scale/weight_zero_point 还原。
+    """
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        unpack_quantized_values_into_int32,
+    )
+    from vllm.scalar_type import scalar_types
+
+    # --- 未量化：直通 ---
+    w = getattr(qkv_proj, "weight", None)
+    if isinstance(w, torch.Tensor):
+        return w.data[q_size:]
+
+    # --- 量化 ---
+    w_packed = getattr(qkv_proj, "weight_packed", None)
+    if w_packed is None:
+        raise AttributeError(
+            "P03: qkv_proj 既无 .weight 也无 .weight_packed。现有参数: "
+            f"{[n for n, _ in qkv_proj.named_parameters()]}"
+        )
+    packed = w_packed.data
+    w_scale = getattr(qkv_proj, "weight_scale", None)
+    w_zp = getattr(qkv_proj, "weight_zero_point", None)
+    w_shape = getattr(qkv_proj, "weight_shape", None)
+    scale = w_scale.data if w_scale is not None else None
+
+    # 打包前原始形状 [out, in]
+    if w_shape is not None and w_shape.numel() == 2:
+        out_full, in_full = int(w_shape[0]), int(w_shape[1])
+    else:
+        out_full = scale.shape[0] if scale is not None else packed.shape[0]
+        in_full = packed.shape[1] * 8          # 保守假定 int4
+
+    # pack_factor 由 in_full / packed 列数精确得出
+    pack_factor = (
+        in_full // packed.shape[1]
+        if packed.dim() == 2 and packed.shape[1] > 0
+        and in_full % packed.shape[1] == 0
+        else 8
+    )
+    bit_width = 32 // max(1, pack_factor)
+    qtype = scalar_types.uint4 if bit_width == 4 else scalar_types.uint8
+
+    def _expand(v, target_cols):
+        """group 量化时把 scale/zero_point 沿列展开到与 q 对齐。"""
+        if v.shape[1] == target_cols:
+            return v
+        group_size = in_full // v.shape[1]
+        if group_size > 1:
+            v = v.repeat_interleave(group_size, dim=1)
+        return v[:, :target_cols]
+
+    # 1) 解包成每元素一个值
+    q = unpack_quantized_values_into_int32(
+        packed, qtype, packed_dim=1
+    ).to(torch.float32)
+
+    # 2) 反量化
+    if scale is not None:
+        s = _expand(scale.to(torch.float32), q.shape[1])
+        if w_zp is not None:
+            zp = unpack_quantized_values_into_int32(
+                w_zp.data, qtype, packed_dim=0
+            ).to(torch.float32)
+            zp = _expand(zp, q.shape[1])[: q.shape[0], : q.shape[1]]
+            q = (q - zp) * s
+        else:
+            q = q * s
+
+    full = q.to(act_dtype)
+
+    # 3) 取 KV 切片
+    if q_size >= full.shape[0]:
+        raise ValueError(
+            f"P03: q_size={q_size} >= 反量化行数 {full.shape[0]}，切分点异常"
+        )
+    out = full[q_size:].contiguous()
+    logger.info_once(
+        "P03: DFlash2 量化 draft qkv_proj 反量化: packed=%s scale=%s -> kv=%s (%s)",
+        tuple(packed.shape),
+        tuple(scale.shape) if scale is not None else None,
+        tuple(out.shape),
+        out.dtype,
+        scope="global",
+    )
+    return out
+
+
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
 
@@ -487,7 +580,13 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        # [P03] gfx906: DFlash2 量化 draft 反量化
+        kv_weights = [
+            _dequantize_kv_slice(
+                a.qkv_proj, a.q_size, self.hidden_norm.weight.dtype
+            )
+            for a in layers_attn
+        ]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
