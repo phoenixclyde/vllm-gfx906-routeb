@@ -487,19 +487,29 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        # [P03] gfx906: DFlash2 量化 draft 反量化
-        kv_weights = [
-            _dequantize_kv_slice(
-                a.qkv_proj, a.q_size, self.hidden_norm.weight.dtype
-            )
-            for a in layers_attn
-        ]
-        self._fused_kv_weight = torch.cat(kv_weights, dim=0)
-        if has_bias:
-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
-            self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
-        else:
+        # [P22] O 方案开关：DF2_NO_FUSED_KV=1 时跳过反量化与 fused 权重构建，
+        #       改由 _project_context_kv 逐层调用官方 qkv_proj（量化 kernel 自行反量化）。
+        self._project_layers = list(layers_attn)
+        if _p22_no_fused():
+            self._fused_kv_weight = None
             self._fused_kv_bias = None
+            logger.info_once(
+                "P22: [O] 跳过 fused KV 权重构建（省 104.9MB 常驻，逐层走官方 qkv_proj）",
+                scope="global",
+            )
+        else:
+            kv_weights = [
+                _dequantize_kv_slice(
+                    a.qkv_proj, a.q_size, self.hidden_norm.weight.dtype
+                )
+                for a in layers_attn
+            ]
+            self._fused_kv_weight = torch.cat(kv_weights, dim=0)
+            if has_bias:
+                kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
+                self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
+            else:
+                self._fused_kv_bias = None
 
         # K-norm weights stacked into one contiguous [num_layers, head_dim]
         # tensor so the per-layer K-norm runs as a single grouped kernel.
@@ -549,6 +559,7 @@ class DFlashQwen3Model(nn.Module):
 
         # References to inner Attention layers for direct cache writes
         self._attn_layers = [layer.self_attn.attn for layer in self.layers]
+        _p21_selfcheck(self, layers_attn)
 
     def _project_context_kv(
         self,
@@ -566,9 +577,20 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
+        if self._fused_kv_weight is None:
+            # [P22] O 方案：逐层官方 qkv_proj（含量化 kernel），只取 KV 行再拼。
+            #   FLOPs 是 fused 版的 3 倍（6144 vs 2048 行/层），只在 prefill context 阶段付出。
+            all_kv_flat = torch.cat(
+                [
+                    a.qkv_proj(normed_context_states)[0][:, a.q_size :]
+                    for a in self._project_layers
+                ],
+                dim=1,
+            )
+        else:
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
@@ -684,7 +706,13 @@ class DFlashQwen3Model(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
             )
-        hidden_states, _ = self.norm(hidden_states, residual)
+        # ---- P18: 末层同样走 fp32（否则 fp32 residual 会被强转 fp16 再次 inf）----
+        if residual is None:
+            hidden_states = self.norm(hidden_states)
+        else:
+            hidden_states = _p18_rms(
+                self.norm, hidden_states.float() + residual.float()
+            )
         return hidden_states
 
     def _preprocess(
@@ -913,6 +941,11 @@ def _dequantize_kv_slice(qkv_proj, q_size: int, act_dtype):
 
     未量化层 : 直接 qkv_proj.weight[q_size:]
     量化层   : 由 weight_packed/weight_scale/weight_zero_point 还原。
+
+    [P21] ① symmetric 且无 zero_point 时走**快路径**：先切 KV 行再解包。
+          打包沿 in 维（列）进行 ⇒ 行可直接切，结果与"全量解包后切"逐位等价，
+          计算量与临时内存降到原来的 1/3。
+          ② 对称性判据由 _p21_symmetric_flag() 给出（读显式标志，冲突即抛错）。
     """
     from vllm.model_executor.layers.quantization.utils.quant_utils import (
         unpack_quantized_values_into_int32,
@@ -954,6 +987,55 @@ def _dequantize_kv_slice(qkv_proj, q_size: int, act_dtype):
     bit_width = 32 // max(1, pack_factor)
     qtype = scalar_types.uint4 if bit_width == 4 else scalar_types.uint8
 
+    # [P21 fix1] 切分点检查必须基于**实际打包行数 packed.shape[0]**。
+    #   w_shape 在 vLLM 的 QKVParallelLinear 上语义不可靠 —— 实测它在 q/k/v
+    #   已融合为 6144 行的层上仍给出 1024（= 单侧 k/v 的行数）；原 P03 把
+    #   out_full 算出来后**从未使用**（死变量），所以问题一直被掩盖。
+    #   用它当闸门会误报并中止加载（rb27_f6 实测）。
+    if q_size >= packed.shape[0]:
+        raise ValueError(
+            "P03: q_size=%d >= 打包权重行数 %d，切分点异常"
+            % (q_size, packed.shape[0])
+        )
+    if (
+        w_shape is not None
+        and w_shape.numel() == 2
+        and int(w_shape[0]) != int(packed.shape[0])
+    ):
+        logger.warning(
+            "P21: weight_shape=%s 与 packed=%s 行数不一致 —— w_shape 语义不可靠，"
+            "已改用 packed 行数（仅提示，不影响加载）",
+            tuple(int(v) for v in w_shape),
+            tuple(packed.shape),
+        )
+
+    symmetric = _p21_symmetric_flag(qkv_proj, w_zp)
+
+    # ===== [P21] 快路径：symmetric 且无 zero_point ⇒ 先切行再解包 =====
+    if symmetric and w_zp is None:
+        kv_packed = packed[q_size:]
+        kv_scale = scale[q_size:].to(torch.float32) if scale is not None else None
+        q = unpack_quantized_values_into_int32(
+            kv_packed, qtype, packed_dim=1
+        ).to(torch.float32)
+        if kv_scale is not None:
+            cols = q.shape[1]
+            s = kv_scale
+            if s.shape[1] != cols:
+                group_size = in_full // s.shape[1]
+                if group_size > 1:
+                    s = s.repeat_interleave(group_size, dim=1)
+                s = s[:, :cols]
+            q = (q - float(1 << (bit_width - 1))) * s
+        out = q.to(act_dtype).contiguous()
+        logger.info_once(
+            "P21: [快路径] 仅解包 KV 行切片: packed=%s -> %s (%s) symmetric=True",
+            tuple(kv_packed.shape), tuple(out.shape), out.dtype,
+            scope="global",
+        )
+        return out
+
+    # ===== 慢路径：含 zero_point / 非对称 —— 保持原实现（全量解包后切）=====
     def _expand(v, target_cols):
         """group 量化时把 scale/zero_point 沿列展开到与 q 对齐。"""
         if v.shape[1] == target_cols:
@@ -978,21 +1060,13 @@ def _dequantize_kv_slice(qkv_proj, q_size: int, act_dtype):
             zp = _expand(zp, q.shape[1])[: q.shape[0], : q.shape[1]]
             q = (q - zp) * s
         else:
-            # ★★ symmetric 量化（无 zero_point）时，packed 以**补码**存储：
-            #    解包得到的却是 0..(2^bits-1) 的无符号值（实测 int4 为 1..15，
-            #    均值恰为 8），必须减去 2^(bits-1) 才能还原有符号值域。
-            #    漏掉这一步会产生 +2^(bits-1)*scale 的系统性偏移 ——
-            #    实测相对误差 417%、权重均值 +0.376（参考为 -0.00003），
-            #    导致 draft 的 fused KV 全错、投机解码接受率趋零。
+            # symmetric 量化（无 zero_point）时 packed 以补码存储，解包得到的是
+            # 0..(2^bits-1) 的无符号值，必须减去 2^(bits-1) 才能还原有符号值域。
             q = (q - float(1 << (bit_width - 1))) * s
 
     full = q.to(act_dtype)
 
     # 3) 取 KV 切片
-    if q_size >= full.shape[0]:
-        raise ValueError(
-            f"P03: q_size={q_size} >= 反量化行数 {full.shape[0]}，切分点异常"
-        )
     out = full[q_size:].contiguous()
     logger.info_once(
         "P03: DFlash2 量化 draft qkv_proj 反量化: packed=%s scale=%s -> kv=%s (%s)",
@@ -1003,3 +1077,288 @@ def _dequantize_kv_slice(qkv_proj, q_size: int, act_dtype):
         scope="global",
     )
     return out
+# ---- P18 fp32 residual stream  /  P19 probes ---------------------------
+_P18 = {"n": 0, "seen": set()}
+_P19 = {"cand": 0, "out": 0}
+
+
+def _p18_rms(norm_mod, x32):
+    """fp32 RMSNorm。输出 dtype 跟随 weight（vLLM 可能把 norm weight 建成 fp32）。"""
+    import torch
+
+    w = norm_mod.weight
+    eps = getattr(norm_mod, "variance_epsilon", None)
+    if eps is None:
+        eps = getattr(norm_mod, "eps", 1e-6)
+    var = x32.pow(2).mean(dim=-1, keepdim=True)
+    y = x32 * torch.rsqrt(var + float(eps))
+    wf = w.float()
+    if "gemma" in type(norm_mod).__name__.lower():
+        wf = wf + 1.0
+    out_dtype = w.dtype if w.dtype in (torch.float16, torch.bfloat16) else torch.float16
+    return (y * wf).to(out_dtype)
+
+
+def _p18_lname(mod) -> str:
+    """返回【完整】layer_name（gate 要拿它去 md 里查）。"""
+    try:
+        a = getattr(getattr(mod, "self_attn", None), "attn", None)
+        nm = getattr(a, "layer_name", None)
+        if nm:
+            return str(nm)
+    except Exception:
+        pass
+    return "?"
+
+
+def _p18_short(nm) -> str:
+    return str(nm).replace(".self_attn.attn", "").replace("model.layers.", "L")
+
+
+def _p18_is_real(mod) -> bool:
+    try:
+        from vllm.forward_context import get_forward_context
+
+        md = getattr(get_forward_context(), "attn_metadata", None)
+        if not isinstance(md, dict) or not md:
+            return False
+        nm = _p18_lname(mod)
+        return (nm in md and md[nm] is not None) or nm == "?"
+    except Exception:
+        return False
+
+
+def _p19_real() -> bool:
+    try:
+        from vllm.forward_context import get_forward_context
+
+        md = getattr(get_forward_context(), "attn_metadata", None)
+        return isinstance(md, dict) and bool(md)
+    except Exception:
+        return False
+
+
+def _p18_trace(mod, res32, out) -> None:
+    """真实推理第一遍打印残差量级/dtype，验证 fp16 溢出不复现（需 P18_TRACE=1）。"""
+    try:
+        import os
+
+        if os.environ.get("P18_TRACE", "") not in ("1", "true", "on"):
+            return
+        import torch
+
+        if _P18["n"] >= 40 or not _p18_is_real(mod):
+            return
+        nm = _p18_lname(mod)
+        key = (nm, "trace")
+        if key in _P18["seen"]:
+            return
+        _P18["seen"].add(key)
+        _P18["n"] += 1
+        print("P18TRACE %-5s res absmax=%-12.5g nonfin=%-6d dtype=%-6s | out absmax=%-12.5g "
+              "nonfin=%-6d dtype=%s"
+              % (_p18_short(nm), float(res32.detach().abs().max()),
+                 int((~torch.isfinite(res32)).sum()),
+                 str(res32.dtype).replace("torch.", ""),
+                 float(out.detach().float().abs().max()),
+                 int((~torch.isfinite(out)).sum()),
+                 str(out.dtype).replace("torch.", "")), flush=True)
+    except Exception:
+        pass
+
+
+def _p18_cand(hidden) -> None:
+    """compute_candidates 的输入（最终 norm 之后）是否还有 NaN。"""
+    try:
+        import torch
+
+        if _P19["cand"] >= 4 or not _p19_real():
+            return
+        if not isinstance(hidden, torch.Tensor) or not hidden.numel():
+            return
+        _P19["cand"] += 1
+        fl = hidden.detach().float()
+        print("P19CAND in shape=%s dtype=%s nonfin=%-8d absmax=%-12.5g absmin=%.5g"
+              % (tuple(hidden.shape), str(hidden.dtype).replace("torch.", ""),
+                 int((~torch.isfinite(fl)).sum()), float(fl.abs().max()),
+                 float(fl.abs().min())), flush=True)
+    except Exception:
+        pass
+
+
+def _p18_cand_out(out) -> None:
+    """候选 token id：若是 0..15 的固定排列 ⇒ logits 仍退化。"""
+    try:
+        import torch
+
+        if _P19["out"] >= 4:
+            return
+        _P19["out"] += 1
+        ids = out[0] if isinstance(out, (tuple, list)) else out
+        lg = out[1] if isinstance(out, (tuple, list)) and len(out) > 1 else None
+        if not isinstance(ids, torch.Tensor):
+            return
+        row = (ids.reshape(-1, ids.shape[-1])[0].tolist()
+               if ids.dim() >= 2 else ids.reshape(-1).tolist())
+        extra = ""
+        if isinstance(lg, torch.Tensor):
+            fl = lg.detach().float()
+            extra = " logits_nonfin=%d logits_absmax=%.5g" % (
+                int((~torch.isfinite(fl)).sum()), float(fl.abs().max()))
+        print("P19CAND out ids=%s head=%s uniq=%d/%d min=%d max=%d%s"
+              % (tuple(ids.shape), row[:16], int(torch.unique(ids).numel()),
+                 int(ids.numel()), int(ids.min()), int(ids.max()), extra), flush=True)
+    except Exception:
+        pass
+
+
+# [P21] 反量化加固：自校验 + 对称性判据
+def _p21_symmetric_flag(qkv_proj, w_zp) -> bool:
+    """判断该量化层是否 symmetric。
+
+    优先从 layer / quant_method / scheme 上读显式 bool；读不到才回退到
+    "无 weight_zero_point ⇒ symmetric"（本仓原实现的推断）。
+    **两者冲突时抛错，不再默默猜** —— P08 曾因漏减 2^(bits-1) 使相对误差达 417%。
+    """
+    explicit = None
+    qm = getattr(qkv_proj, "quant_method", None)
+    for obj in (qkv_proj, qm, getattr(qm, "scheme", None)):
+        if obj is None:
+            continue
+        v = getattr(obj, "symmetric", None)
+        if isinstance(v, bool):
+            explicit = v
+            break
+    inferred = w_zp is None
+    if explicit is not None and explicit != inferred:
+        raise RuntimeError(
+            "P21: 量化对称性判据冲突 —— 显式 symmetric=%s，但 weight_zero_point %s。"
+            "拒绝猜测（P08 曾因漏减 2^(bits-1) 导致相对误差 417%%）。"
+            % (explicit, "存在" if w_zp is not None else "缺失")
+        )
+    return explicit if explicit is not None else inferred
+
+
+def _p21_slow_kv_slice(qkv_proj, q_size: int, act_dtype):
+    """[P21] 慢路径参照实现：**全量解包后再切 KV 行**（原 P03 的做法）。
+
+    仅用于 `P21_SELFCHECK=full` 的强校验 —— 代价是 3 倍临时内存，**不要放在默认
+    路径上**（实测快路径能省出可观的 KV 池，把慢路径加回来会吃掉这部分收益）。
+    """
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        unpack_quantized_values_into_int32,
+    )
+    from vllm.scalar_type import scalar_types
+
+    w = getattr(qkv_proj, "weight", None)
+    if isinstance(w, torch.Tensor):
+        return w.data[q_size:].to(act_dtype)
+
+    packed = qkv_proj.weight_packed.data
+    w_scale = getattr(qkv_proj, "weight_scale", None)
+    scale = w_scale.data if w_scale is not None else None
+    in_full = packed.shape[1] * 8
+    pack_factor = in_full // packed.shape[1] if packed.shape[1] > 0 else 8
+    bit_width = 32 // max(1, pack_factor)
+    qtype = scalar_types.uint4 if bit_width == 4 else scalar_types.uint8
+
+    q = unpack_quantized_values_into_int32(packed, qtype, packed_dim=1).to(torch.float32)
+    if scale is not None:
+        s = scale.to(torch.float32)
+        if s.shape[1] != q.shape[1]:
+            gs = in_full // s.shape[1]
+            if gs > 1:
+                s = s.repeat_interleave(gs, dim=1)
+            s = s[:, : q.shape[1]]
+        q = (q - float(1 << (bit_width - 1))) * s
+    return q.to(act_dtype)[q_size:].contiguous()
+
+
+def _p21_selfcheck(model, layers_attn) -> None:
+    """[P21] 加载期校验。
+
+    **默认（轻量）**：只查 `_fused_kv_weight` 的有限性与量级 —— 挡得住 P08 那类
+      "反量化写错 ⇒ 数值荒诞 ⇒ 接受率静默归零" 的灾难，且**不产生额外内存峰值**。
+      轻量是硬要求：实测快路径能省出可观的 KV 池（rb27_f5 7.66 → f6b 9.24 GiB），
+      加回慢路径会把这部分收益吃掉。
+
+    **`P21_SELFCHECK=full`**：追加强校验 —— 逐层比 "快路径 vs 慢路径全量解包"，
+      要求逐位相同（数学等价 ⇒ max_abs_diff 必须恰为 0），并顺带核对
+      `_fused_kv_weight` 的按层拼接。诊断用。
+
+    ⚠️ 原版曾用 "官方量化路径 `a.qkv_proj(normed)`" 做参照，但 exllama 后端会
+      抛 `AssertionError: Zero points are required by Exllama`（symmetric 权重无 zp），
+      故该参照已移除。
+    """
+    try:
+        import os
+
+        import torch
+
+        w_fused = getattr(model, "_fused_kv_weight", None)
+        if w_fused is None:
+            logger.warning("P21: 自校验跳过（_fused_kv_weight 缺失）")
+            return
+
+        with torch.no_grad():
+            wf = w_fused.detach().float()
+            nonfin = int((~torch.isfinite(wf)).sum().item())
+            absmax = float(wf.abs().max().item()) if wf.numel() else 0.0
+            absmean = float(wf.abs().mean().item()) if wf.numel() else 0.0
+        logger.info(
+            "P21: 加载期自校验(轻量) fused_kv_weight shape=%s nonfinite=%d "
+            "absmax=%.5g absmean=%.5g",
+            tuple(w_fused.shape), nonfin, absmax, absmean,
+        )
+        if nonfin:
+            raise RuntimeError(
+                "P21: _fused_kv_weight 含 %d 个非有限值 —— 反量化有误，已中止加载。"
+                % nonfin
+            )
+        if absmax == 0.0 or absmax > 1e4 or absmean == 0.0:
+            raise RuntimeError(
+                "P21: _fused_kv_weight 量级异常 (absmax=%.5g absmean=%.5g) —— "
+                "反量化有误，已中止加载。" % (absmax, absmean)
+            )
+
+        if os.environ.get("P21_SELFCHECK", "").lower() not in ("full", "1", "on"):
+            return
+
+        # ---- 强校验：快路径 vs 慢路径（数学等价 ⇒ 逐位相同）----
+        worst = 0.0
+        with torch.no_grad():
+            for i, a in enumerate(layers_attn):
+                fast = _dequantize_kv_slice(a.qkv_proj, a.q_size, w_fused.dtype)
+                slow = _p21_slow_kv_slice(a.qkv_proj, a.q_size, w_fused.dtype)
+                if fast.shape != slow.shape:
+                    raise RuntimeError(
+                        "P21: 快/慢路径形状不一致 %s vs %s"
+                        % (tuple(fast.shape), tuple(slow.shape))
+                    )
+                worst = max(worst, float((fast.float() - slow.float()).abs().max().item()))
+                seg = w_fused[i * fast.shape[0]: (i + 1) * fast.shape[0]]
+                if seg.shape[0] == fast.shape[0]:
+                    worst = max(worst, float((seg.float() - fast.float()).abs().max().item()))
+        logger.info(
+            "P21: 强校验 快路径 vs 慢路径 max_abs_diff=%.6g（数学等价，应为 0）",
+            worst,
+        )
+        if worst != 0.0:
+            raise RuntimeError(
+                "P21: 快路径与慢路径不一致 (max_abs_diff=%.6g) —— 反量化实现有误，"
+                "已中止加载。" % worst
+            )
+    except RuntimeError:
+        raise
+    except Exception as e:  # 自校验本身不可用时不阻断加载
+        logger.warning("P21: 自校验执行失败（不阻断加载）: %s: %s", type(e).__name__, e)
+
+
+# [P22] context-KV 投影 A/O 双路开关
+def _p22_no_fused() -> bool:
+    """DF2_NO_FUSED_KV=1 时走 O 方案（逐层官方 qkv_proj，不做反量化）。"""
+    import os
+
+    return os.environ.get("DF2_NO_FUSED_KV", "").strip().lower() in (
+        "1", "true", "on", "yes",
+    )

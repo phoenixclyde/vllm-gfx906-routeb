@@ -17,6 +17,14 @@ from .qwen3_dflash import (
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
 )
+
+# P18/P19: helper 定义在 qwen3_dflash.py 末尾，此处显式引入
+from .qwen3_dflash import (  # noqa: F401
+    _p18_rms,
+    _p18_trace,
+    _p18_cand,
+    _p18_cand_out,
+)
 from .utils import maybe_prefix
 
 
@@ -144,21 +152,29 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # ---- P18: fp32 残差流（修 gfx906 fp16 溢出 → NaN）----
         if residual is None:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+            _p18_res = hidden_states.float()
         else:
-            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            _p18_res = residual.float() + hidden_states.float()
+        hidden_states = _p18_rms(self.input_layernorm, _p18_res)
 
         hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        hidden_states = self.attention_conv.finish(hidden_states, coefficients)
+        hidden_states = self.attention_conv.finish(
+            hidden_states.float(), coefficients
+        )
 
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        _p18_res = _p18_res + hidden_states.float()
+        hidden_states = _p18_rms(self.post_attention_layernorm, _p18_res)
+
         hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
-        return hidden_states, residual
+        hidden_states = self.mlp_conv.finish(
+            hidden_states.float(), coefficients
+        )
+        _p18_trace(self, _p18_res, hidden_states)
+        return hidden_states, _p18_res
 
 
 def _score_edges(
@@ -282,9 +298,12 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     def compute_candidates(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return self.candidate_logits_processor.get_top_k_tokens(
+        _p18_cand(hidden_states)
+        _p19_out = self.candidate_logits_processor.get_top_k_tokens(
             self.lm_head, hidden_states, self.model.candidate_selector.top_k
         )
+        _p18_cand_out(_p19_out)
+        return _p19_out
 
 
 EntryClass = DFlash2Qwen3ForCausalLM
